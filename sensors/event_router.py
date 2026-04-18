@@ -24,7 +24,24 @@ class EventRouter:
         visual_score_threshold: float = 0.6,
     ) -> None:
         self.capture_cooldown_sec = capture_cooldown_sec
-        self.visual_labels = visual_labels or {"face", "person", "smoke", "fire", "hazard"}
+        labels = visual_labels or {
+            "face",
+            "person",
+            "smoke",
+            "fire",
+            "hazard",
+            "mask",
+            "hardhat",
+            "no-hardhat",
+            "no-mask",
+            "no-safety vest",
+            "machinery",
+            "vehicle",
+            "utility pole",
+            "safety cone",
+            "safety vest",
+        }
+        self.visual_labels = {label.strip().lower() for label in labels}
         self.visual_score_threshold = visual_score_threshold
         self._last_capture_ts = 0.0
 
@@ -55,7 +72,7 @@ class EventRouter:
 
         if (
             detection is not None
-            and detection.label in self.visual_labels
+            and detection.label.strip().lower() in self.visual_labels
             and detection.score >= self.visual_score_threshold
         ):
             self._last_capture_ts = now

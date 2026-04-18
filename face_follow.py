@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import signal
 import sys
@@ -13,7 +14,13 @@ from pipeline.poi_exporter import POIExporter
 from pipeline.vlm_worker import VLMWorker, default_annotator
 from sensors.event_router import EventRouter
 from sensors.sensor_bridge import SensorBridge
-from vision.detectors import Detection, HaarFaceDetector, YoloOnnxDetector
+from vision.detectors import (
+    ConstructionHazardOnnxDetector,
+    Detection,
+    HaarFaceDetector,
+    UltralyticsOnnxDetector,
+    YoloOnnxDetector,
+)
 from vision.target_selection import TargetSelector
 
 
@@ -47,12 +54,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-preview", action="store_true", help="Show OpenCV preview")
     parser.add_argument("--dry-run-arm", action="store_true", help="Skip hardware arm connection")
 
-    parser.add_argument("--detector", choices=["haar", "yolo"], default="haar")
+    parser.add_argument(
+        "--detector",
+        choices=["haar", "yolo", "construction_hazard"],
+        default="haar",
+    )
     parser.add_argument("--yolo-onnx", default="", help="Path to YOLO ONNX model")
+    parser.add_argument(
+        "--construction-hazard-onnx",
+        default="",
+        help="Path to Construction-Hazard-Detection ONNX model",
+    )
     parser.add_argument(
         "--yolo-labels",
         default="",
         help="Comma-separated class labels for YOLO classes",
+    )
+    parser.add_argument("--detector-conf", type=float, default=0.35)
+    parser.add_argument("--detector-nms", type=float, default=0.45)
+    parser.add_argument("--detector-input-size", type=int, default=640)
+    parser.add_argument(
+        "--detector-backend",
+        choices=["auto", "opencv", "onnxruntime"],
+        default="auto",
+        help="Inference backend for ultralytics-style ONNX models",
+    )
+    parser.add_argument("--max-detections", type=int, default=120)
+    parser.add_argument(
+        "--debug-detections",
+        action="store_true",
+        help="Print per-second detection label counts for detector debugging",
     )
     parser.add_argument(
         "--priority-map",
@@ -107,10 +138,41 @@ def parse_args() -> argparse.Namespace:
 def build_detector(args: argparse.Namespace):
     if args.detector == "haar":
         return HaarFaceDetector()
+    if args.detector == "construction_hazard":
+        model_path = args.construction_hazard_onnx or args.yolo_onnx
+        if not model_path:
+            raise ValueError(
+                "--construction-hazard-onnx (or --yolo-onnx) is required when "
+                "--detector construction_hazard"
+            )
+        return ConstructionHazardOnnxDetector(
+            model_path=model_path,
+            conf_threshold=args.detector_conf,
+            nms_threshold=args.detector_nms,
+            input_size=args.detector_input_size,
+            max_detections=args.max_detections,
+            backend=args.detector_backend,
+        )
     if not args.yolo_onnx:
         raise ValueError("--yolo-onnx must be provided when --detector yolo")
     labels = [token.strip() for token in args.yolo_labels.split(",") if token.strip()]
-    return YoloOnnxDetector(model_path=args.yolo_onnx, class_names=labels)
+    if labels:
+        return UltralyticsOnnxDetector(
+            model_path=args.yolo_onnx,
+            class_names=labels,
+            conf_threshold=args.detector_conf,
+            nms_threshold=args.detector_nms,
+            input_size=args.detector_input_size,
+            max_detections=args.max_detections,
+            backend=args.detector_backend,
+        )
+    return YoloOnnxDetector(
+        model_path=args.yolo_onnx,
+        class_names=labels,
+        conf_threshold=args.detector_conf,
+        nms_threshold=args.detector_nms,
+        input_size=(args.detector_input_size, args.detector_input_size),
+    )
 
 
 def draw_preview(
@@ -225,6 +287,7 @@ def main() -> None:
     previous_target: tuple[float, float] | None = None
     last_telemetry_ts = time.time()
     frame_counter = 0
+    label_counter: collections.Counter[str] = collections.Counter()
 
     print("[INFO] Tracking started. Press 'q' in preview window to stop.")
     try:
@@ -239,6 +302,9 @@ def main() -> None:
             frame_counter += 1
             now = time.time()
             detections = detector.detect(frame, frame_id=frame_id, ts=now)
+            if args.debug_detections:
+                for det in detections:
+                    label_counter[det.label] += 1
             selected_target = target_selector.select(
                 detections,
                 frame.shape,
@@ -331,6 +397,9 @@ def main() -> None:
                         "invalid_lines": health.invalid_lines,
                         "last_valid_ts": health.last_valid_ts,
                     }
+                if args.debug_detections:
+                    telemetry["label_counts"] = dict(label_counter.most_common(8))
+                    label_counter.clear()
                 print(json.dumps(telemetry))
                 last_telemetry_ts = now
                 frame_counter = 0
