@@ -1,203 +1,349 @@
 import argparse
+import json
 import signal
 import sys
-import threading
 import time
 
 import cv2
-from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+
+from control.arm_controller import ArmControllerConfig, SOArmController
+from control.tracking_controller import TrackingController
+from pipeline.capture_pipeline import CapturePipeline
+from pipeline.poi_exporter import POIExporter
+from pipeline.vlm_worker import VLMWorker, default_annotator
+from sensors.event_router import EventRouter
+from sensors.sensor_bridge import SensorBridge
+from vision.detectors import Detection, HaarFaceDetector, YoloOnnxDetector
+from vision.target_selection import TargetSelector
 
 
-# python face_follow.py --port COM3 --camera-index 1 --show-preview
-
-DEFAULT_STATE = {
-    "shoulder_pan.pos": 0.0,
-    "shoulder_lift.pos": 0.0,
-    "elbow_flex.pos": 0.0,
-    "wrist_flex.pos": 0.0,
-    "wrist_roll.pos": 0.0,
-    "gripper.pos": 0.0,
-}
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+def parse_priority_map(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not raw.strip():
+        return out
+    for token in raw.split(","):
+        if "=" not in token:
+            continue
+        key, value = token.split("=", maxsplit=1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        try:
+            out[key] = int(value)
+        except ValueError:
+            continue
+    return out
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Detect a face and steer SO-101 camera toward it."
+        description="Face/Hazard tracking pipeline with SO-101 + optional Arduino sensor fusion."
     )
-    parser.add_argument("--port", default="COM3", help="Serial port for follower arm")
+    parser.add_argument("--port", default="COM3", help="Serial port for SO-101 follower")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index")
+    parser.add_argument("--send-hz", type=float, default=30.0, help="Arm send loop Hz")
+    parser.add_argument("--max-joint", type=float, default=100.0, help="Joint command clamp")
+    parser.add_argument("--show-preview", action="store_true", help="Show OpenCV preview")
+    parser.add_argument("--dry-run-arm", action="store_true", help="Skip hardware arm connection")
+
+    parser.add_argument("--detector", choices=["haar", "yolo"], default="haar")
+    parser.add_argument("--yolo-onnx", default="", help="Path to YOLO ONNX model")
     parser.add_argument(
-        "--camera-index",
-        type=int,
-        default=0,
-        help="OpenCV camera index (0 = default webcam)",
+        "--yolo-labels",
+        default="",
+        help="Comma-separated class labels for YOLO classes",
     )
     parser.add_argument(
-        "--send-hz", type=float, default=30.0, help="Robot send loop frequency"
+        "--priority-map",
+        default="fire=100,smoke=95,gas=90,hazard=85,person=70,face=60",
+        help="Target priority map (label=priority,...)",
     )
+
+    parser.add_argument("--pan-gain", type=float, default=45.0)
+    parser.add_argument("--lift-gain", type=float, default=35.0)
+    parser.add_argument("--deadzone", type=float, default=0.07)
+    parser.add_argument("--max-step", type=float, default=2.2)
+    parser.add_argument("--ema-alpha", type=float, default=0.35)
+    parser.add_argument("--frames-before-scan", type=int, default=10)
+    parser.add_argument("--scan-step", type=float, default=0.7)
+
+    parser.add_argument("--sensor-port", default="", help="Arduino serial port (optional)")
+    parser.add_argument("--sensor-baud", type=int, default=9600)
     parser.add_argument(
-        "--pan-gain",
+        "--sensor-replay",
+        default="",
+        help="Path to replay file with SensorRead.ino style telemetry lines",
+    )
+    parser.add_argument("--sensor-cooldown", type=float, default=1.0)
+
+    parser.add_argument("--enable-capture", action="store_true")
+    parser.add_argument("--capture-dir", default="photos")
+    parser.add_argument("--poi-jsonl", default="captures/poi.jsonl")
+    parser.add_argument("--capture-cooldown", type=float, default=3.0)
+    parser.add_argument("--visual-score-threshold", type=float, default=0.6)
+    parser.add_argument("--enable-vlm-worker", action="store_true")
+    parser.add_argument(
+        "--default-depth-m",
         type=float,
-        default=45.0,
-        help="Gain for horizontal correction (higher = more aggressive)",
+        default=1.5,
+        help="Fallback depth used when ultrasonic DIST is unavailable",
     )
     parser.add_argument(
-        "--lift-gain",
+        "--camera-hfov-deg",
         type=float,
-        default=35.0,
-        help="Gain for vertical correction (higher = more aggressive)",
+        default=70.0,
+        help="Approximate horizontal FOV for pseudo-3D projection",
     )
     parser.add_argument(
-        "--deadzone",
+        "--camera-vfov-deg",
         type=float,
-        default=0.07,
-        help="Ignore tracking error magnitude below this normalized threshold",
-    )
-    parser.add_argument(
-        "--max-step",
-        type=float,
-        default=2.2,
-        help="Max joint change per frame in arm command units",
-    )
-    parser.add_argument(
-        "--max-joint",
-        type=float,
-        default=100.0,
-        help="Clamp for shoulder commands (matches teleop range)",
-    )
-    parser.add_argument(
-        "--show-preview",
-        action="store_true",
-        help="Show camera preview window with detections",
+        default=43.0,
+        help="Approximate vertical FOV for pseudo-3D projection",
     )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    state = dict(DEFAULT_STATE)
-    state_lock = threading.Lock()
-    stop_event = threading.Event()
+def build_detector(args: argparse.Namespace):
+    if args.detector == "haar":
+        return HaarFaceDetector()
+    if not args.yolo_onnx:
+        raise ValueError("--yolo-onnx must be provided when --detector yolo")
+    labels = [token.strip() for token in args.yolo_labels.split(",") if token.strip()]
+    return YoloOnnxDetector(model_path=args.yolo_onnx, class_names=labels)
 
-    robot = SO101Follower(
-        SO101FollowerConfig(
-            port=args.port,
-            id="follower",
+
+def draw_preview(
+    frame,
+    detections: list[Detection],
+    selected: Detection | None,
+    mode: str,
+    smoothed_target: tuple[float, float] | None,
+) -> None:
+    h, w = frame.shape[:2]
+    frame_center = (int(w / 2), int(h / 2))
+    cv2.circle(frame, frame_center, 4, (0, 180, 255), -1)
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox_xyxy
+        color = (50, 220, 50) if selected and det == selected else (255, 180, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            f"{det.label}:{det.score:.2f}",
+            (x1, max(14, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
         )
+    if smoothed_target is not None:
+        tx = int(smoothed_target[0] * w)
+        ty = int(smoothed_target[1] * h)
+        cv2.circle(frame, (tx, ty), 4, (255, 50, 180), -1)
+    cv2.putText(
+        frame,
+        f"mode={mode}",
+        (10, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (230, 230, 230),
+        2,
+        cv2.LINE_AA,
     )
 
+
+def main() -> None:
+    args = parse_args()
+
+    arm = SOArmController(
+        ArmControllerConfig(
+            port=args.port,
+            send_hz=args.send_hz,
+            max_joint=args.max_joint,
+            dry_run=args.dry_run_arm,
+        )
+    )
+    detector = build_detector(args)
+    target_selector = TargetSelector(class_priority=parse_priority_map(args.priority_map))
+    tracker = TrackingController(
+        pan_gain=args.pan_gain,
+        lift_gain=args.lift_gain,
+        deadzone=args.deadzone,
+        max_step=args.max_step,
+        max_joint=args.max_joint,
+        ema_alpha=args.ema_alpha,
+        frames_before_scan=args.frames_before_scan,
+        scan_step_size=args.scan_step,
+    )
+    event_router = EventRouter(
+        capture_cooldown_sec=args.capture_cooldown,
+        visual_score_threshold=args.visual_score_threshold,
+    )
+
+    sensor_bridge = None
+    if args.sensor_port or args.sensor_replay:
+        sensor_bridge = SensorBridge(
+            serial_port=args.sensor_port or None,
+            baud_rate=args.sensor_baud,
+            replay_file=args.sensor_replay or None,
+            event_cooldown_sec=args.sensor_cooldown,
+        )
+        sensor_bridge.start()
+
+    capture_pipeline = None
+    poi_exporter = None
+    vlm_worker = None
+    if args.enable_capture:
+        capture_pipeline = CapturePipeline(output_dir=args.capture_dir, write_overlay=True)
+        poi_exporter = POIExporter(output_jsonl=args.poi_jsonl)
+        if args.enable_vlm_worker:
+            vlm_worker = VLMWorker(capture_pipeline=capture_pipeline)
+            vlm_worker.start()
+
     print(f"[INFO] Connecting to robot on {args.port}...")
-    robot.connect()
-    print("[OK] Robot connected")
+    arm.connect()
+    arm.start()
+    print("[OK] Robot loop started")
+
+    cap = cv2.VideoCapture(args.camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open camera index {args.camera_index}. Try another --camera-index."
+        )
+
+    should_stop = False
 
     def shutdown(*_args) -> None:
-        if stop_event.is_set():
-            return
-        print("\n[INFO] Shutting down...")
-        stop_event.set()
-        try:
-            robot.disconnect()
-        except Exception:
-            pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+        nonlocal should_stop
+        should_stop = True
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    def send_loop() -> None:
-        period = 1.0 / args.send_hz
-        while not stop_event.is_set():
-            with state_lock:
-                robot.send_action(dict(state))
-            time.sleep(period)
+    frame_id = 0
+    previous_target: tuple[float, float] | None = None
+    last_telemetry_ts = time.time()
+    frame_counter = 0
 
-    sender = threading.Thread(target=send_loop, daemon=True)
-    sender.start()
+    print("[INFO] Tracking started. Press 'q' in preview window to stop.")
+    try:
+        while not should_stop:
+            ok, frame = cap.read()
+            if not ok:
+                print("[WARN] Camera read failed; retrying...")
+                time.sleep(0.05)
+                continue
 
-    cap = cv2.VideoCapture(args.camera_index)
-    if not cap.isOpened():
-        shutdown()
-        raise RuntimeError(
-            f"Could not open camera index {args.camera_index}. "
-            "Try another --camera-index value."
-        )
+            frame_id += 1
+            frame_counter += 1
+            now = time.time()
+            detections = detector.detect(frame, frame_id=frame_id, ts=now)
+            selected_target = target_selector.select(
+                detections,
+                frame.shape,
+                previous_center_norm=previous_target,
+            )
 
-    face_detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    if face_detector.empty():
-        shutdown()
-        raise RuntimeError("Failed to load OpenCV haarcascade_frontalface_default.xml")
+            selected_detection = (
+                selected_target.detection if selected_target is not None else None
+            )
+            target_center = (
+                selected_target.center_norm_xy if selected_target is not None else None
+            )
+            previous_target = target_center
 
-    print("[INFO] Face tracking started. Press 'q' in preview window to quit.")
-    while not stop_event.is_set():
-        ok, frame = cap.read()
-        if not ok:
-            print("[WARN] Camera read failed; retrying...")
-            time.sleep(0.05)
-            continue
+            arm_state = arm.get_state()
+            command = tracker.update(
+                target_center,
+                current_pan=arm_state["shoulder_pan.pos"],
+            )
+            arm.update_pan_lift(command.pan_delta, command.lift_delta)
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(40, 40),
-        )
+            sensor_snapshot = sensor_bridge.get_latest_snapshot() if sensor_bridge else None
+            sensor_events = sensor_bridge.pop_events() if sensor_bridge else []
+            decision = event_router.decide(selected_detection, sensor_events)
 
-        frame_h, frame_w = frame.shape[:2]
-        frame_cx = frame_w / 2.0
-        frame_cy = frame_h / 2.0
-
-        if len(faces) > 0:
-            # Track the largest detected face to reduce jitter.
-            x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
-            face_cx = x + (w / 2.0)
-            face_cy = y + (h / 2.0)
-
-            err_x = (face_cx - frame_cx) / frame_w
-            err_y = (face_cy - frame_cy) / frame_h
-
-            if abs(err_x) < args.deadzone:
-                err_x = 0.0
-            if abs(err_y) < args.deadzone:
-                err_y = 0.0
-
-            step_pan = clamp(err_x * args.pan_gain, -args.max_step, args.max_step)
-            # Positive vertical pixel error means face is lower in frame.
-            step_lift = clamp(err_y * args.lift_gain, -args.max_step, args.max_step)
-
-            with state_lock:
-                state["shoulder_pan.pos"] = clamp(
-                    state["shoulder_pan.pos"] + step_pan,
-                    -args.max_joint,
-                    args.max_joint,
+            if decision.should_capture and capture_pipeline and poi_exporter:
+                state_for_capture = arm.get_state()
+                record = capture_pipeline.capture(
+                    frame=frame,
+                    detection=selected_detection,
+                    detections=detections,
+                    arm_state=state_for_capture,
+                    sensor_snapshot=sensor_snapshot,
+                    trigger_reason=decision.reason or "unknown",
+                    risk_level=decision.risk_level,
+                    trigger_score=decision.trigger_score,
                 )
-                state["shoulder_lift.pos"] = clamp(
-                    state["shoulder_lift.pos"] + step_lift,
-                    -args.max_joint,
-                    args.max_joint,
+                if vlm_worker is not None:
+                    vlm_worker.submit(record)
+                else:
+                    capture_pipeline.update_metadata(record, default_annotator(record))
+                poi_exporter.export(
+                    record=record,
+                    arm_state=state_for_capture,
+                    event_type=decision.reason or "unknown",
+                    confidence=decision.trigger_score,
+                    selected_detection=selected_detection,
+                    frame_shape=frame.shape,
+                    sensor_snapshot=sensor_snapshot,
+                    default_depth_m=args.default_depth_m,
+                    horizontal_fov_deg=args.camera_hfov_deg,
+                    vertical_fov_deg=args.camera_vfov_deg,
                 )
 
             if args.show_preview:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (50, 220, 50), 2)
-                cv2.circle(frame, (int(face_cx), int(face_cy)), 4, (50, 220, 50), -1)
+                draw_preview(
+                    frame,
+                    detections=detections,
+                    selected=selected_detection,
+                    mode=command.mode,
+                    smoothed_target=command.smoothed_target,
+                )
+                cv2.imshow("SO-101 Face/Hazard Follow", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    should_stop = True
 
+            if (now - last_telemetry_ts) >= 1.0:
+                fps = frame_counter / (now - last_telemetry_ts)
+                state = arm.get_state()
+                telemetry = {
+                    "timestamp": now,
+                    "mode": command.mode,
+                    "fps": round(fps, 2),
+                    "detections": len(detections),
+                    "selected_label": selected_detection.label if selected_detection else None,
+                    "selected_score": (
+                        round(selected_detection.score, 3)
+                        if selected_detection is not None
+                        else None
+                    ),
+                    "joints": {
+                        "shoulder_pan.pos": round(state["shoulder_pan.pos"], 3),
+                        "shoulder_lift.pos": round(state["shoulder_lift.pos"], 3),
+                    },
+                }
+                if sensor_bridge:
+                    health = sensor_bridge.get_health()
+                    telemetry["sensor_health"] = {
+                        "valid_lines": health.valid_lines,
+                        "invalid_lines": health.invalid_lines,
+                        "last_valid_ts": health.last_valid_ts,
+                    }
+                print(json.dumps(telemetry))
+                last_telemetry_ts = now
+                frame_counter = 0
+    finally:
+        cap.release()
         if args.show_preview:
-            cv2.circle(frame, (int(frame_cx), int(frame_cy)), 5, (0, 180, 255), -1)
-            cv2.imshow("SO-101 Face Follow", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                shutdown()
-                break
-
-    cap.release()
-    shutdown()
+            cv2.destroyAllWindows()
+        if sensor_bridge is not None:
+            sensor_bridge.stop()
+        if vlm_worker is not None:
+            vlm_worker.stop()
+        arm.stop()
+        print("[INFO] Shutdown complete.")
     sys.exit(0)
 
 
