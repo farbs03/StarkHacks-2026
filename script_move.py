@@ -35,7 +35,6 @@ state = {
 def send_loop():
     while True:
         robot.send_action(state)
-        time.sleep(0.03)
 
 
 threading.Thread(target=send_loop, daemon=True).start()
@@ -48,14 +47,13 @@ root.title("SO-101 Teleop GUI")
 def add_slider(name, row):
     def update(val):
         state[name] = float(val)
-        print(f"[GUI] {name} = {state[name]:.3f}")
 
     tk.Label(root, text=name).grid(row=row, column=0)
 
     s = tk.Scale(
         root,
-        from_=-100,
-        to=100,
+        from_=-150,
+        to=150,
         resolution=1,
         orient=tk.HORIZONTAL,
         length=400,
