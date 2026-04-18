@@ -1,0 +1,8 @@
+We have a smoke detector, ultrasonic detector, sound detector, light sensor, IR sensor, and relay module, and are wiring these into an arduino.
+
+We are using AMD's LeRobot arms, where we'll have a camera and all of our sensors attached to it.
+
+We want to use computer vision to detect potentially hazardous events, and have the robotic arm automatically
+adjust its camera to that event to take a picture. This will then be sent to a vlm to get a natural language description, and a point of interest will be saved to a 3D point cloud.
+
+After scanning an area, the user will be able to virtually traverse the area with the points of interest visible in a 3D space. Clicking on a point will show the image that was taken along with its natural language description.
