@@ -8,6 +8,8 @@ import cv2
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 
+# python face_follow.py --port COM3 --camera-index 1 --show-preview
+
 DEFAULT_STATE = {
     "shoulder_pan.pos": 0.0,
     "shoulder_lift.pos": 0.0,
