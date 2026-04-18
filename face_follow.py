@@ -8,7 +8,7 @@ import time
 import cv2
 
 from control.arm_controller import ArmControllerConfig, SOArmController
-from control.tracking_controller import TrackingController
+from control.tracking_controller import ControlCommand, TrackingController
 from pipeline.capture_pipeline import CapturePipeline
 from pipeline.poi_exporter import POIExporter
 from pipeline.vlm_worker import VLMWorker, default_annotator
@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         help="Inference backend for ultralytics-style ONNX models",
     )
     parser.add_argument("--max-detections", type=int, default=120)
+    parser.add_argument(
+        "--detector-interval-sec",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between detector queries (0 = every frame)",
+    )
     parser.add_argument(
         "--debug-detections",
         action="store_true",
@@ -288,6 +294,8 @@ def main() -> None:
     last_telemetry_ts = time.time()
     frame_counter = 0
     label_counter: collections.Counter[str] = collections.Counter()
+    last_detection_ts = -1e9
+    cached_detections: list[Detection] = []
 
     print("[INFO] Tracking started. Press 'q' in preview window to stop.")
     try:
@@ -301,34 +309,57 @@ def main() -> None:
             frame_id += 1
             frame_counter += 1
             now = time.time()
-            detections = detector.detect(frame, frame_id=frame_id, ts=now)
-            if args.debug_detections:
-                for det in detections:
-                    label_counter[det.label] += 1
-            selected_target = target_selector.select(
-                detections,
-                frame.shape,
-                previous_center_norm=previous_target,
+            should_run_detector = (
+                args.detector_interval_sec <= 0.0
+                or (now - last_detection_ts) >= args.detector_interval_sec
+                or not cached_detections
             )
+            if should_run_detector:
+                cached_detections = detector.detect(frame, frame_id=frame_id, ts=now)
+                last_detection_ts = now
+                if args.debug_detections:
+                    for det in cached_detections:
+                        label_counter[det.label] += 1
 
-            selected_detection = (
-                selected_target.detection if selected_target is not None else None
-            )
-            target_center = (
-                selected_target.center_norm_xy if selected_target is not None else None
-            )
-            previous_target = target_center
-
+            detections = cached_detections
+            selected_detection = None
+            target_center = None
             arm_state = arm.get_state()
-            command = tracker.update(
-                target_center,
-                current_pan=arm_state["shoulder_pan.pos"],
-            )
+
+            if should_run_detector:
+                selected_target = target_selector.select(
+                    detections,
+                    frame.shape,
+                    previous_center_norm=previous_target,
+                )
+                selected_detection = (
+                    selected_target.detection if selected_target is not None else None
+                )
+                target_center = (
+                    selected_target.center_norm_xy if selected_target is not None else None
+                )
+                previous_target = target_center
+                command = tracker.update(
+                    target_center,
+                    current_pan=arm_state["shoulder_pan.pos"],
+                )
+            else:
+                # Hold the arm perfectly still between detector queries.
+                command = ControlCommand(
+                    pan_delta=0.0,
+                    lift_delta=0.0,
+                    mode="hold_between_queries",
+                    smoothed_target=tracker.smoothed_target,
+                )
             arm.update_pan_lift(command.pan_delta, command.lift_delta)
 
             sensor_snapshot = sensor_bridge.get_latest_snapshot() if sensor_bridge else None
             sensor_events = sensor_bridge.pop_events() if sensor_bridge else []
-            decision = event_router.decide(selected_detection, sensor_events)
+            # Trigger vision events only on fresh detector results.
+            decision = event_router.decide(
+                selected_detection if should_run_detector else None,
+                sensor_events,
+            )
 
             if decision.should_capture and capture_pipeline and poi_exporter:
                 state_for_capture = arm.get_state()
@@ -363,7 +394,7 @@ def main() -> None:
                 draw_preview(
                     frame,
                     detections=detections,
-                    selected=selected_detection,
+                    selected=selected_detection if should_run_detector else None,
                     mode=command.mode,
                     smoothed_target=command.smoothed_target,
                 )
@@ -379,6 +410,8 @@ def main() -> None:
                     "mode": command.mode,
                     "fps": round(fps, 2),
                     "detections": len(detections),
+                    "detector_ran_this_frame": should_run_detector,
+                    "detector_interval_sec": args.detector_interval_sec,
                     "selected_label": selected_detection.label if selected_detection else None,
                     "selected_score": (
                         round(selected_detection.score, 3)
