@@ -1,18 +1,25 @@
 import argparse
 import collections
 import json
+from pathlib import Path
 import signal
 import sys
 import time
 
 import cv2
+from dotenv import load_dotenv
 
 from control.arm_controller import ArmControllerConfig, SOArmController
 from control.tracking_controller import ControlCommand, TrackingController
 from pipeline.capture_pipeline import CapturePipeline
 from pipeline.poi_exporter import POIExporter
 from pipeline.sparse_point_cloud_exporter import SparsePointCloudExporter
-from pipeline.vlm_worker import VLMWorker, default_annotator
+from pipeline.vlm_worker import (
+    VLMWorker,
+    build_gemini_annotator,
+    build_openai_compatible_annotator,
+    default_annotator,
+)
 from sensors.event_router import EventRouter
 from sensors.sensor_bridge import SensorBridge
 from vision.detectors import (
@@ -55,9 +62,74 @@ def parse_priority_map(raw: str) -> dict[str, int]:
     return out
 
 
+def _load_json_config(config_path: str) -> dict:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a JSON object: {path}")
+    return data
+
+
+def _apply_config_defaults(parser: argparse.ArgumentParser, config: dict) -> None:
+    valid_dests = {action.dest for action in parser._actions}
+    defaults: dict[str, object] = {}
+    unknown: list[str] = []
+    for raw_key, value in config.items():
+        key = str(raw_key).replace("-", "_")
+        if key in valid_dests:
+            defaults[key] = value
+        else:
+            unknown.append(str(raw_key))
+    if unknown:
+        raise ValueError(
+            "Unknown config key(s): "
+            + ", ".join(sorted(unknown))
+            + ". Keys should match argparse option names without '--'."
+        )
+    parser.set_defaults(**defaults)
+
+
+def _return_arm_to_pose(
+    arm: SOArmController,
+    target_pose: dict[str, float],
+    *,
+    duration_sec: float,
+    interp_hz: float = 40.0,
+) -> None:
+    if duration_sec <= 0.0:
+        arm.set_neutral_pose(target_pose)
+        time.sleep(0.2)
+        return
+
+    start_pose = arm.get_state()
+    joint_keys = sorted(set(start_pose.keys()) | set(target_pose.keys()))
+    steps = max(1, int(duration_sec * interp_hz))
+    step_sleep = duration_sec / steps
+
+    for i in range(1, steps + 1):
+        t = i / steps
+        blended: dict[str, float] = {}
+        for key in joint_keys:
+            a = float(start_pose.get(key, 0.0))
+            b = float(target_pose.get(key, a))
+            blended[key] = a + (b - a) * t
+        arm.set_neutral_pose(blended)
+        time.sleep(step_sleep)
+
+    arm.set_neutral_pose(target_pose)
+    time.sleep(0.2)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Face/Hazard tracking pipeline with SO-101 + optional Arduino sensor fusion."
+    )
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Path to JSON config file for runtime options",
     )
     parser.add_argument("--port", default="COM3", help="Serial port for SO-101 follower")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index")
@@ -116,6 +188,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema-alpha", type=float, default=0.35)
     parser.add_argument("--frames-before-scan", type=int, default=10)
     parser.add_argument("--scan-step", type=float, default=0.7)
+    parser.add_argument(
+        "--return-to-start-pose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Return arm to startup pose on shutdown",
+    )
+    parser.add_argument(
+        "--return-to-start-duration-sec",
+        type=float,
+        default=2.0,
+        help="Seconds to smoothly return to startup pose before disconnect",
+    )
 
     parser.add_argument("--sensor-port", default="", help="Arduino serial port (optional)")
     parser.add_argument("--sensor-baud", type=int, default=9600)
@@ -151,6 +235,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-score-threshold", type=float, default=0.6)
     parser.add_argument("--enable-vlm-worker", action="store_true")
     parser.add_argument(
+        "--vlm-provider",
+        choices=["stub", "openai_compatible", "gemini"],
+        default="gemini",
+        help="VLM backend for event summarization",
+    )
+    parser.add_argument("--vlm-model", default="gemini-2.5-flash")
+    parser.add_argument(
+        "--vlm-base-url",
+        default="",
+        help="Override provider base URL (OpenAI-compatible or Gemini)",
+    )
+    parser.add_argument(
+        "--vlm-api-key",
+        default="",
+        help="API key for VLM (or set OPENAI_API_KEY env var)",
+    )
+    parser.add_argument("--vlm-timeout-sec", type=float, default=45.0)
+    parser.add_argument(
+        "--vlm-run-mode",
+        choices=["end", "realtime"],
+        default="end",
+        help="Run VLM annotations at script end (default) or as captures happen",
+    )
+    parser.add_argument(
         "--default-depth-m",
         type=float,
         default=1.5,
@@ -168,6 +276,10 @@ def parse_args() -> argparse.Namespace:
         default=43.0,
         help="Approximate vertical FOV for pseudo-3D projection",
     )
+    prelim_args, _ = parser.parse_known_args()
+    if prelim_args.config:
+        config = _load_json_config(prelim_args.config)
+        _apply_config_defaults(parser, config)
     return parser.parse_args()
 
 
@@ -252,6 +364,8 @@ def draw_preview(
 
 
 def main() -> None:
+    # Load local .env so keys like GEMINI_API_KEY are available automatically.
+    load_dotenv()
     args = parse_args()
 
     arm = SOArmController(
@@ -294,6 +408,8 @@ def main() -> None:
     poi_exporter = None
     sparse_point_cloud_exporter = None
     vlm_worker = None
+    vlm_annotator = None
+    pending_vlm_records = []
     if args.enable_capture:
         capture_pipeline = CapturePipeline(output_dir=args.capture_dir, write_overlay=True)
         poi_exporter = POIExporter(output_jsonl=args.poi_jsonl)
@@ -301,12 +417,30 @@ def main() -> None:
             output_jsonl=args.sparse_point_cloud_jsonl,
         )
         if args.enable_vlm_worker:
-            vlm_worker = VLMWorker(capture_pipeline=capture_pipeline)
-            vlm_worker.start()
+            annotator = default_annotator
+            if args.vlm_provider == "openai_compatible":
+                annotator = build_openai_compatible_annotator(
+                    model=args.vlm_model,
+                    api_key=args.vlm_api_key or None,
+                    base_url=args.vlm_base_url or None,
+                    timeout_sec=args.vlm_timeout_sec,
+                )
+            elif args.vlm_provider == "gemini":
+                annotator = build_gemini_annotator(
+                    model=args.vlm_model,
+                    api_key=args.vlm_api_key or None,
+                    base_url=args.vlm_base_url or None,
+                    timeout_sec=args.vlm_timeout_sec,
+                )
+            vlm_annotator = annotator
+            if args.vlm_run_mode == "realtime":
+                vlm_worker = VLMWorker(capture_pipeline=capture_pipeline, annotator=annotator)
+                vlm_worker.start()
 
     print(f"[INFO] Connecting to robot on {args.port}...")
     arm.connect()
     arm.start()
+    startup_pose = arm.get_state()
     print("[OK] Robot loop started")
 
     cap = cv2.VideoCapture(args.camera_index)
@@ -425,6 +559,8 @@ def main() -> None:
                 )
                 if vlm_worker is not None:
                     vlm_worker.submit(record)
+                elif vlm_annotator is not None:
+                    pending_vlm_records.append(record)
                 else:
                     capture_pipeline.update_metadata(record, default_annotator(record))
                 poi_exporter.export(
@@ -510,6 +646,29 @@ def main() -> None:
             sensor_bridge.stop()
         if vlm_worker is not None:
             vlm_worker.stop()
+        if (
+            capture_pipeline is not None
+            and vlm_annotator is not None
+            and pending_vlm_records
+        ):
+            print(f"[INFO] Running VLM on {len(pending_vlm_records)} captures...")
+            for record in pending_vlm_records:
+                try:
+                    patch = vlm_annotator(record)
+                except Exception as exc:
+                    patch = default_annotator(record)
+                    patch["vlm_error"] = str(exc)
+                capture_pipeline.update_metadata(record, patch)
+        if args.return_to_start_pose and not args.dry_run_arm:
+            try:
+                print("[INFO] Returning arm to startup pose...")
+                _return_arm_to_pose(
+                    arm,
+                    startup_pose,
+                    duration_sec=args.return_to_start_duration_sec,
+                )
+            except Exception as exc:
+                print(f"[WARN] Failed to return to startup pose: {exc}")
         arm.stop()
         print("[INFO] Shutdown complete.")
     sys.exit(0)
