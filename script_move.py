@@ -7,8 +7,8 @@ import sys
 from lerobot.robots.so_follower import SO101FollowerConfig, SO101Follower
 
 
-PORT = "/dev/tty.usbmodem5AE60844281"
-#PORT = "COM3"
+# PORT = "/dev/tty.usbmodem5AE60844281"
+PORT = "COM3"
 
 
 robot = SO101Follower(

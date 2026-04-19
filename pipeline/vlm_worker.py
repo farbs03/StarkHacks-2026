@@ -62,9 +62,20 @@ def _decode_json_string_literal(value: str) -> str:
 def _extract_string_field(text: str, field: str) -> str:
     pattern = rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"'
     match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
+    if match:
+        return _decode_json_string_literal(match.group(1)).strip()
+
+    # Recovery for truncated JSON where the closing quote is missing.
+    partial_pattern = rf'"{re.escape(field)}"\s*:\s*"([\s\S]*)$'
+    partial = re.search(partial_pattern, text, flags=re.IGNORECASE)
+    if not partial:
         return ""
-    return _decode_json_string_literal(match.group(1)).strip()
+    candidate = partial.group(1)
+    candidate = candidate.replace("\r", "").replace("\n", " ").strip()
+    # Keep only the first logical segment if another key appears later.
+    candidate = re.split(r'"\s*,\s*"[A-Za-z0-9_]+"\s*:', candidate, maxsplit=1)[0]
+    candidate = candidate.rstrip('",} ')
+    return _decode_json_string_literal(candidate).strip()
 
 
 def _extract_string_array_field(text: str, field: str) -> list[str]:
@@ -272,7 +283,7 @@ def build_gemini_annotator(
             ],
             "generationConfig": {
                 "temperature": 0.2,
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 1024,
                 "response_mime_type": "application/json",
             },
         }
