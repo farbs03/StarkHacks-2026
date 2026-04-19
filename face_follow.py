@@ -11,6 +11,7 @@ from control.arm_controller import ArmControllerConfig, SOArmController
 from control.tracking_controller import ControlCommand, TrackingController
 from pipeline.capture_pipeline import CapturePipeline
 from pipeline.poi_exporter import POIExporter
+from pipeline.sparse_point_cloud_exporter import SparsePointCloudExporter
 from pipeline.vlm_worker import VLMWorker, default_annotator
 from sensors.event_router import EventRouter
 from sensors.sensor_bridge import SensorBridge
@@ -22,6 +23,17 @@ from vision.detectors import (
     YoloOnnxDetector,
 )
 from vision.target_selection import TargetSelector
+
+
+def _opencv_highgui_available() -> bool:
+    """False when OpenCV is built without GUI (e.g. opencv-python-headless)."""
+    try:
+        probe = "__opencv_gui_probe__"
+        cv2.namedWindow(probe, cv2.WINDOW_NORMAL)
+        cv2.destroyWindow(probe)
+        return True
+    except cv2.error:
+        return False
 
 
 def parse_priority_map(raw: str) -> dict[str, int]:
@@ -123,6 +135,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-capture", action="store_true")
     parser.add_argument("--capture-dir", default="photos")
     parser.add_argument("--poi-jsonl", default="captures/poi.jsonl")
+    _sparse_default = "captures/sparse_points.jsonl"
+    parser.add_argument(
+        "--sparse-point-cloud-jsonl",
+        nargs="?",
+        const=_sparse_default,
+        default=_sparse_default,
+        metavar="PATH",
+        help=(
+            "JSONL path for sparse 3D points (same trigger as POI). "
+            f"Default {_sparse_default!r}. With no PATH, uses that default."
+        ),
+    )
     parser.add_argument("--capture-cooldown", type=float, default=3.0)
     parser.add_argument("--visual-score-threshold", type=float, default=0.6)
     parser.add_argument("--enable-vlm-worker", action="store_true")
@@ -268,10 +292,14 @@ def main() -> None:
 
     capture_pipeline = None
     poi_exporter = None
+    sparse_point_cloud_exporter = None
     vlm_worker = None
     if args.enable_capture:
         capture_pipeline = CapturePipeline(output_dir=args.capture_dir, write_overlay=True)
         poi_exporter = POIExporter(output_jsonl=args.poi_jsonl)
+        sparse_point_cloud_exporter = SparsePointCloudExporter(
+            output_jsonl=args.sparse_point_cloud_jsonl,
+        )
         if args.enable_vlm_worker:
             vlm_worker = VLMWorker(capture_pipeline=capture_pipeline)
             vlm_worker.start()
@@ -286,6 +314,18 @@ def main() -> None:
         raise RuntimeError(
             f"Could not open camera index {args.camera_index}. Try another --camera-index."
         )
+
+    preview_gui_ok = False
+    if args.show_preview:
+        if _opencv_highgui_available():
+            preview_gui_ok = True
+        else:
+            print(
+                "[WARN] OpenCV has no GUI (typical with opencv-python-headless). "
+                "Preview disabled. Run without --show-preview, or install "
+                "opencv-python for a desktop window.",
+                file=sys.stderr,
+            )
 
     should_stop = False
 
@@ -304,7 +344,10 @@ def main() -> None:
     last_detection_ts = -1e9
     cached_detections: list[Detection] = []
 
-    print("[INFO] Tracking started. Press 'q' in preview window to stop.")
+    if preview_gui_ok:
+        print("[INFO] Tracking started. Press 'q' in the preview window to stop.")
+    else:
+        print("[INFO] Tracking started (headless). Ctrl+C to stop.")
     try:
         while not should_stop:
             ok, frame = cap.read()
@@ -368,7 +411,7 @@ def main() -> None:
                 sensor_events,
             )
 
-            if decision.should_capture and capture_pipeline and poi_exporter:
+            if decision.should_capture and capture_pipeline and poi_exporter and sparse_point_cloud_exporter:
                 state_for_capture = arm.get_state()
                 record = capture_pipeline.capture(
                     frame=frame,
@@ -396,8 +439,21 @@ def main() -> None:
                     horizontal_fov_deg=args.camera_hfov_deg,
                     vertical_fov_deg=args.camera_vfov_deg,
                 )
+                sparse_point_cloud_exporter.append_observation(
+                    record=record,
+                    arm_state=state_for_capture,
+                    event_type=decision.reason or "unknown",
+                    risk_level=decision.risk_level,
+                    trigger_score=decision.trigger_score,
+                    selected_detection=selected_detection,
+                    frame_shape=frame.shape,
+                    sensor_snapshot=sensor_snapshot,
+                    default_depth_m=args.default_depth_m,
+                    horizontal_fov_deg=args.camera_hfov_deg,
+                    vertical_fov_deg=args.camera_vfov_deg,
+                )
 
-            if args.show_preview:
+            if preview_gui_ok:
                 draw_preview(
                     frame,
                     detections=detections,
@@ -445,8 +501,11 @@ def main() -> None:
                 frame_counter = 0
     finally:
         cap.release()
-        if args.show_preview:
-            cv2.destroyAllWindows()
+        if preview_gui_ok:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
         if sensor_bridge is not None:
             sensor_bridge.stop()
         if vlm_worker is not None:
