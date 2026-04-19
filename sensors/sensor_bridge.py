@@ -69,6 +69,22 @@ def parse_sensor_line(line: str, ts: float | None = None) -> SensorSnapshot | No
         return None
 
 
+def parse_sensor_dict(data: dict[str, int], ts: float | None = None) -> SensorSnapshot | None:
+    now = time.time() if ts is None else ts
+    try:
+        return SensorSnapshot(
+            ldr=int(data["LDR"]),
+            ir=int(data["IR"]),
+            sound=int(data["SOUND"]),
+            gas=int(data["GAS"]),
+            dist=int(data["DIST"]),
+            risk=int(data["RISK"]) == 1,
+            timestamp=now,
+        )
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 class SensorBridge:
     def __init__(
         self,
@@ -78,8 +94,11 @@ class SensorBridge:
         replay_file: str | None = None,
         replay_sleep_sec: float = 0.1,
         event_cooldown_sec: float = 1.0,
+        use_sensor_serial_module: bool = False,
     ) -> None:
-        if serial_port is None and replay_file is None:
+        if use_sensor_serial_module and replay_file is not None:
+            raise ValueError("replay_file is not supported with sensor_serial module mode")
+        if not use_sensor_serial_module and serial_port is None and replay_file is None:
             raise ValueError("Provide either serial_port or replay_file for SensorBridge")
 
         self.serial_port = serial_port
@@ -87,6 +106,7 @@ class SensorBridge:
         self.replay_file = replay_file
         self.replay_sleep_sec = replay_sleep_sec
         self.event_cooldown_sec = event_cooldown_sec
+        self.use_sensor_serial_module = use_sensor_serial_module
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -102,6 +122,10 @@ class SensorBridge:
         self._thread.start()
 
     def _run(self) -> None:
+        if self.use_sensor_serial_module:
+            self._run_from_sensor_serial_module()
+            return
+
         if self.serial_port is not None:
             with serial.Serial(self.serial_port, self.baud_rate, timeout=1) as ser:
                 self._run_from_serial(ser)
@@ -110,6 +134,32 @@ class SensorBridge:
         replay_path = Path(self.replay_file or "")
         with replay_path.open("r", encoding="utf-8") as handle:
             self._run_from_replay(handle)
+
+    def _run_from_sensor_serial_module(self) -> None:
+        try:
+            from Arduino import sensor_serial
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import Arduino.sensor_serial. "
+                "Ensure Arduino/sensor_serial.py exists and is importable."
+            ) from exc
+
+        reader_port = self.serial_port or sensor_serial.DEFAULT_PORT
+        reader_baud = self.baud_rate or sensor_serial.DEFAULT_BAUD
+        with sensor_serial.ArduinoSensorReader(
+            port=reader_port,
+            baudrate=reader_baud,
+        ) as reader:
+            while not self._stop_event.is_set():
+                payload = reader.read_sensor_data()
+                snapshot = parse_sensor_dict(payload) if payload is not None else None
+                if snapshot is None:
+                    self._health.invalid_lines += 1
+                    continue
+                self._latest_snapshot = snapshot
+                self._health.valid_lines += 1
+                self._health.last_valid_ts = snapshot.timestamp
+                self._emit_events(snapshot)
 
     def _run_from_serial(self, ser: serial.Serial) -> None:
         while not self._stop_event.is_set():

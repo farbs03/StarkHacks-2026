@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensor-port", default="", help="Arduino serial port (optional)")
     parser.add_argument("--sensor-baud", type=int, default=9600)
     parser.add_argument(
+        "--sensor-source",
+        choices=["bridge", "sensor_serial"],
+        default="bridge",
+        help="Sensor reader source: direct bridge parser or Arduino/sensor_serial.py",
+    )
+    parser.add_argument(
         "--sensor-replay",
         default="",
         help="Path to replay file with SensorRead.ino style telemetry lines",
@@ -250,12 +256,13 @@ def main() -> None:
     )
 
     sensor_bridge = None
-    if args.sensor_port or args.sensor_replay:
+    if args.sensor_port or args.sensor_replay or args.sensor_source == "sensor_serial":
         sensor_bridge = SensorBridge(
             serial_port=args.sensor_port or None,
             baud_rate=args.sensor_baud,
             replay_file=args.sensor_replay or None,
             event_cooldown_sec=args.sensor_cooldown,
+            use_sensor_serial_module=(args.sensor_source == "sensor_serial"),
         )
         sensor_bridge.start()
 

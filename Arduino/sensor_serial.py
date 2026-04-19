@@ -23,7 +23,7 @@ SENSOR_KEYS: Final[tuple[str, ...]] = (
     "RISK",
 )
 
-DEFAULT_PORT: Final[str] = "COM3"
+DEFAULT_PORT: Final[str] = "COM4"
 DEFAULT_BAUD: Final[int] = 9600
 
 _default_serial: serial.Serial | None = None
